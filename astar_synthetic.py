@@ -1092,3 +1092,193 @@ class CostTracker:
     # If P were 50x50 (N=5, M=10), SVD would be ~15% — still okay.
     # If P were 200x200, you'd need randomized SVD.
 
+
+# ============================================
+# STEP 9: Full Training Loop (with cost tracking)
+# ============================================
+
+def train_model(
+    method: str,                 # "baseline", "contrastive", "cycle", "mi", "ours", "ours+contrastive"
+    corruption_rate: float = 0.0,
+    seed: int = 42,
+    modality_configs: Optional[Dict] = None,
+) -> Tuple:
+    """
+    Train one model with a specific consistency method.
+
+    Returns: (model, history, cost_tracker)
+    """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    if modality_configs is None:
+        modality_configs = {
+            "audio": (cfg.audio_raw_dim, cfg.tokens_per_modality["audio"]),
+            "video": (cfg.video_raw_dim, cfg.tokens_per_modality["video"]),
+            "text":  (cfg.text_raw_dim, cfg.tokens_per_modality["text"]),
+        }
+
+    modality_names = sorted(modality_configs.keys())
+    tokens_per_mod = {name: t for name, (_, t) in modality_configs.items()}
+    raw_dims = {name: d for name, (d, _) in modality_configs.items()}
+
+    # Create datasets — concept_seed=0 is fixed across ALL runs so
+    # concept vectors and projections are identical everywhere.
+    # The per-split seed only controls sample generation and noise.
+    train_dataset = MultiTokenSyntheticDataset(
+        cfg.num_train_samples, cfg.num_concepts,
+        tokens_per_mod, raw_dims, corruption_rate,
+        seed=seed, concept_seed=0,
+    )
+    val_dataset = MultiTokenSyntheticDataset(
+        cfg.num_val_samples, cfg.num_concepts,
+        tokens_per_mod, raw_dims, corruption_rate=0.0,
+        seed=seed + 1000, concept_seed=0,
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.batch_size)
+
+    model = MultimodalTransformerMultiToken(cfg.num_concepts, modality_configs).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=cfg.num_epochs
+    )
+    criterion = nn.CrossEntropyLoss()
+    cost_tracker = CostTracker()
+
+    history = {
+        "train_loss": [], "val_acc": [],
+        "nuclear_norm": [], "effective_rank": [],
+    }
+
+    for epoch in range(cfg.num_epochs):
+        model.train()
+        epoch_losses = []
+        epoch_nn = []
+
+        for batch in train_loader:
+            *modality_inputs_list, labels = batch
+            modality_inputs = {
+                name: inp.to(device) for name, inp in zip(modality_names, modality_inputs_list)
+            }
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+
+            # ---- Forward ----
+            t0 = time.time()
+            logits, attn_dict, encoded = model(modality_inputs)
+            t_forward = time.time() - t0
+
+            # ---- Task loss ----
+            task_loss = criterion(logits, labels)
+
+            # ---- Consistency loss (depends on method) ----
+            t0 = time.time()
+
+            if method == "baseline":
+                consistency_loss_val = torch.tensor(0.0, device=device)
+
+            elif method == "contrastive":
+                consistency_loss_val = contrastive_loss(encoded, labels)
+
+            elif method == "cycle":
+                consistency_loss_val = cycle_consistency_loss(attn_dict, modality_names)
+
+            elif method == "mi":
+                consistency_loss_val = mutual_information_loss(encoded, labels)
+
+            elif method in ("ours", "ours+contrastive"):
+                # Build P matrix
+                t_p0 = time.time()
+                P = build_batch_P_matrices(
+                    attn_dict, modality_names, tokens_per_mod, len(labels)
+                )
+                t_build_P = time.time() - t_p0
+
+                # Nuclear norm
+                t_svd0 = time.time()
+                if cfg.use_randomized_svd and cfg.svd_top_k > 0:
+                    consistency_loss_val = nuclear_norm_loss_randomized(
+                        P, top_k=cfg.svd_top_k, epsilon=cfg.svd_epsilon
+                    )
+                else:
+                    consistency_loss_val = nuclear_norm_loss(
+                        P, tokens_per_mod, len(modality_names),
+                        epsilon=cfg.svd_epsilon
+                    )
+                t_svd = time.time() - t_svd0
+
+                cost_tracker.record("build_P", t_build_P)
+                cost_tracker.record("svd", t_svd)
+
+                # Optionally add contrastive too
+                if method == "ours+contrastive":
+                    consistency_loss_val += contrastive_loss(encoded, labels)
+
+                epoch_nn.append(consistency_loss_val.item())
+
+            # ---- Attention entropy penalty (prevents uniform collapse) ----
+            # Negative entropy = encourages peaked attention distributions
+            attn_entropy_loss = torch.tensor(0.0, device=device)
+            if cfg.lambda_attn_entropy > 0:
+                for (_, _), weights in attn_dict.items():
+                    # weights: (B, T_q, T_k), already softmax'd
+                    ent = -(weights * (weights + 1e-10).log()).sum(dim=-1)  # (B, T_q)
+                    attn_entropy_loss = attn_entropy_loss + ent.mean()
+                attn_entropy_loss = attn_entropy_loss / len(attn_dict)
+
+            # ---- Total loss ----
+            if method == "baseline":
+                total_loss = task_loss + cfg.lambda_attn_entropy * attn_entropy_loss
+            else:
+                total_loss = task_loss + cfg.lambda_consistency * consistency_loss_val + cfg.lambda_attn_entropy * attn_entropy_loss
+
+            # ---- Backward ----
+            t0 = time.time()
+            total_loss.backward()
+
+            # Gradient clipping (important for SVD gradient stability)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+            t_backward = time.time() - t0
+
+            cost_tracker.record("forward_pass", t_forward)
+            cost_tracker.record("backward_pass", t_backward)
+            cost_tracker.record("total_step", t_forward + t_backward)
+
+            epoch_losses.append(total_loss.item())
+
+        scheduler.step()
+
+        # ---- Validation ----
+        model.eval()
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                *modality_inputs_list, labels = batch
+                modality_inputs = {
+                    name: inp.to(device) for name, inp in zip(modality_names, modality_inputs_list)
+                }
+                labels = labels.to(device)
+                logits, _, _ = model(modality_inputs)
+                val_correct += (logits.argmax(-1) == labels).sum().item()
+                val_total += len(labels)
+
+        val_acc = val_correct / val_total
+        history["train_loss"].append(np.mean(epoch_losses))
+        history["val_acc"].append(val_acc)
+        if epoch_nn:
+            history["nuclear_norm"].append(np.mean(epoch_nn))
+
+        if epoch % 20 == 0:
+            print(f"  [{method}] Epoch {epoch}: val_acc={val_acc:.3f}, "
+                  f"loss={np.mean(epoch_losses):.4f}")
+
+    return model, history, cost_tracker
+
