@@ -423,3 +423,92 @@ class MultimodalTransformerMultiToken(nn.Module):
 
         return logits, attn_dict, encoded
 
+
+# ============================================
+# STEP 3: Build the Block P Matrix (Multi-Token)
+# ============================================
+# With multi-token, P is a proper block matrix where 
+# each block is (T_i x T_j) — not just scalars.
+
+def build_P_matrix(
+    attn_dict: Dict[Tuple[str, str], torch.Tensor],
+    modality_names: List[str],
+    tokens_per_modality: Dict[str, int],
+    batch_idx: int = 0,
+) -> torch.Tensor:
+    """
+    Assemble the (sum(T_i) x sum(T_j)) block matrix P 
+    for a SINGLE sample in the batch.
+
+    For 3 modalities with T_a=5, T_v=4, T_t=3:
+    P is (12 x 12) with structure:
+
+        |  I_5    A_av   A_at  |
+    P = |  A_va   I_4    A_vt  |
+        |  A_ta   A_tv   I_3   |
+
+    where A_av is the (5 x 4) cross-attention matrix 
+    from audio to video for this sample.
+    """
+    # Compute total dimension
+    sizes = [tokens_per_modality[name] for name in modality_names]
+    total = sum(sizes)
+    N = len(modality_names)
+
+    P = torch.zeros(total, total)
+
+    # Fill blocks
+    row_offset = 0
+    for i, name_i in enumerate(modality_names):
+        T_i = sizes[i]
+        col_offset = 0
+        for j, name_j in enumerate(modality_names):
+            T_j = sizes[j]
+            if i == j:
+                # Diagonal: identity
+                P[row_offset:row_offset+T_i, col_offset:col_offset+T_j] = \
+                    torch.eye(T_i)
+            else:
+                # Off-diagonal: cross-attention weights for this sample
+                # attn_dict[(name_i, name_j)] is (B, T_i, T_j)
+                P[row_offset:row_offset+T_i, col_offset:col_offset+T_j] = \
+                    attn_dict[(name_i, name_j)][batch_idx]
+            col_offset += T_j
+        row_offset += T_i
+
+    return P  # (total x total), e.g. (12 x 12)
+
+
+def build_batch_P_matrices(
+    attn_dict: Dict[Tuple[str, str], torch.Tensor],
+    modality_names: List[str],
+    tokens_per_modality: Dict[str, int],
+    batch_size: int,
+) -> torch.Tensor:
+    """
+    Build P for every sample in the batch.
+    Returns: (B, total, total) — a batch of P matrices.
+
+    Uses torch.cat to preserve autograd gradient flow from attention
+    weights through to the nuclear norm loss.
+    """
+    # Determine device from attention dict values
+    device = next(iter(attn_dict.values())).device
+
+    block_rows = []
+    for i, name_i in enumerate(modality_names):
+        T_i = tokens_per_modality[name_i]
+        row_blocks = []
+        for j, name_j in enumerate(modality_names):
+            T_j = tokens_per_modality[name_j]
+            if i == j:
+                row_blocks.append(
+                    torch.eye(T_i, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+                )
+            else:
+                row_blocks.append(attn_dict[(name_i, name_j)])
+        block_rows.append(torch.cat(row_blocks, dim=2))  # (B, T_i, total)
+
+    P = torch.cat(block_rows, dim=1)  # (B, total, total)
+    return P
+
