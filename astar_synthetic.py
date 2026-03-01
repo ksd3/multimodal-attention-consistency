@@ -289,3 +289,51 @@ class ModalityEncoder(nn.Module):
         h = self.norm(h + self.mlp(h))                  # FFN + residual
         return h
 
+
+class CrossAttentionLayer(nn.Module):
+    """
+    Cross-attention with extractable attention weights.
+    Returns both the output AND the raw attention matrix.
+    """
+    def __init__(self, hidden_dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, query, key_value):
+        """
+        query:     (B, T_q, D)
+        key_value: (B, T_k, D)
+
+        returns:
+            output:  (B, T_q, D)
+            weights: (B, T_q, T_k) — averaged over heads
+        """
+        B, T_q, D = query.shape
+        T_k = key_value.size(1)
+
+        Q = self.q_proj(query).view(B, T_q, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(key_value).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(key_value).view(B, T_k, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Scaled dot-product attention
+        scale = self.head_dim ** 0.5
+        scores = (Q @ K.transpose(-2, -1)) / scale     # (B, H, T_q, T_k)
+        weights = F.softmax(scores, dim=-1)             # (B, H, T_q, T_k)
+
+        # Weighted sum of values
+        attn_output = (weights @ V).transpose(1, 2).reshape(B, T_q, D)
+        output = self.out_proj(attn_output)
+        output = self.norm(query + output)  # residual connection
+
+        # Average weights over heads for the P matrix
+        avg_weights = weights.mean(dim=1)   # (B, T_q, T_k)
+
+        return output, avg_weights
+
