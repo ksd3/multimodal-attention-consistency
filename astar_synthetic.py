@@ -590,3 +590,57 @@ def nuclear_norm_loss_randomized(
 
 
 # --- (b) BASELINE: Contrastive Loss (CLIP-style) ---
+
+def contrastive_loss(
+    embeddings_dict: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+    temperature: float = 0.07,
+) -> torch.Tensor:
+    """
+    Standard InfoNCE contrastive loss between all modality pairs.
+    This is what CLIP does, extended to N modalities.
+
+    For each pair (mod_i, mod_j):
+    - Pool tokens to get one vector per sample: (B, D)
+    - Compute cosine similarity matrix: (B, B)
+    - Diagonal entries should be highest (same concept)
+
+    LIMITATION THIS PAPER EXPOSES:
+    This loss only enforces PAIRWISE alignment.
+    It does NOT enforce TRANSITIVE consistency.
+    A↔B can be perfect and B↔C can be perfect, 
+    but A↔C can still be wrong.
+    """
+    modality_names = sorted(embeddings_dict.keys())
+    total_loss = 0
+    num_pairs = 0
+
+    for i, name_i in enumerate(modality_names):
+        for j, name_j in enumerate(modality_names):
+            if i >= j:
+                continue
+
+            # Pool tokens → one vector per sample
+            emb_i = embeddings_dict[name_i].mean(dim=1)  # (B, D)
+            emb_j = embeddings_dict[name_j].mean(dim=1)  # (B, D)
+
+            # Normalize
+            emb_i = F.normalize(emb_i, dim=-1)
+            emb_j = F.normalize(emb_j, dim=-1)
+
+            # Cosine similarity matrix
+            sim = (emb_i @ emb_j.T) / temperature  # (B, B)
+
+            # Targets: samples with same concept_id should match
+            # For simplicity, use diagonal (each sample matches itself)
+            targets = torch.arange(sim.size(0), device=sim.device)
+
+            loss_ij = F.cross_entropy(sim, targets)
+            loss_ji = F.cross_entropy(sim.T, targets)
+            total_loss += (loss_ij + loss_ji) / 2
+            num_pairs += 1
+
+    return total_loss / num_pairs
+
+
+# --- (c) BASELINE: Cycle-Consistency Loss ---
