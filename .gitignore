@@ -10,6 +10,7 @@ uv.lock
 *.json
 bench_*.py
 main.py
+*.pdf
 .astar_synthetic_full.py
 .run_parallel_full.py
 .run_exp_b_full.py

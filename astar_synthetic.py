@@ -1627,8 +1627,6 @@ def evaluate_robustness(model, dataset, degradation, modality_names, batch_size=
     return correct / total
 
 
-
-
 # ============================================
 # RUN
 # ============================================

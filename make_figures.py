@@ -246,7 +246,7 @@ def fig5_lambda_sensitivity():
 
 
 def fig6_summary():
-    """Combined summary figure ."""
+    """Combined summary figure."""
     fig = plt.figure(figsize=(14, 10))
 
     # --- Panel A: Classification ---
