@@ -1,0 +1,15 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv/
+uv.lock
+*.log
+*.json
+bench_*.py
+main.py
+.astar_synthetic_full.py
+.run_parallel_full.py
+.run_exp_b_full.py
