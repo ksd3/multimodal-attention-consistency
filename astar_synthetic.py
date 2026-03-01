@@ -732,3 +732,125 @@ def mutual_information_loss(
 
     return total_loss / num_pairs
 
+
+# ============================================
+# STEP 5: Evaluation Metrics
+# ============================================
+# Standard retrieval metrics, not just argmax accuracy.
+
+def compute_retrieval_metrics(
+    attn_dict: Dict[Tuple[str, str], torch.Tensor],
+    labels: torch.Tensor,
+    modality_names: List[str],
+) -> Dict[str, float]:
+    """
+    For each modality pair, compute:
+    - Recall@1: is the top-attended token from the correct concept?
+    - Recall@5: is the correct concept in the top 5?
+    - MRR: mean reciprocal rank of the correct match
+
+    These are STANDARD retrieval metrics used in CLIP, ImageBind, etc.
+    Using them makes results comparable to prior work.
+    """
+    results = {}
+
+    for name_i in modality_names:
+        for name_j in modality_names:
+            if name_i == name_j:
+                continue
+
+            key = (name_i, name_j)
+            if key not in attn_dict:
+                continue
+
+            # Pool attention over tokens to get sample-level similarity
+            # attn_dict[key]: (B, T_i, T_j)
+            # Sum over source and target tokens → (B,) per pair
+            # But we need (B, B) for retrieval, so we need batch-level attention.
+            #
+            # For retrieval: use pooled embeddings instead of attention
+            # (This is more standard and avoids the B vs T confusion)
+            #
+            # We'll compute this from embeddings in the actual evaluation function.
+            pass
+
+    return results
+
+
+def evaluate_retrieval_from_embeddings(
+    model: nn.Module,
+    dataset: Dataset,
+    modality_names: List[str],
+    batch_size: int = 256,
+) -> Dict[str, float]:
+    """
+    Proper retrieval evaluation:
+    1. Encode all samples
+    2. For each modality pair, compute (N_test x N_test) similarity matrix
+    3. For each query, rank all candidates and check where the true match falls
+    """
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    all_embeddings = {name: [] for name in modality_names}
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in loader:
+            *modality_inputs_list, labels = batch
+            modality_inputs = {
+                name: inp.to(device) for name, inp in zip(modality_names, modality_inputs_list)
+            }
+            _, _, encoded = model(modality_inputs)
+
+            for name in modality_names:
+                # Pool tokens → (B, D)
+                pooled = encoded[name].mean(dim=1)
+                all_embeddings[name].append(pooled.cpu())
+            all_labels.append(labels)
+
+    # Concatenate (on CPU for large similarity matrices)
+    for name in modality_names:
+        all_embeddings[name] = F.normalize(
+            torch.cat(all_embeddings[name], dim=0), dim=-1
+        )
+    all_labels = torch.cat(all_labels, dim=0)
+
+    # Compute retrieval metrics for each pair
+    results = {}
+    for name_i in modality_names:
+        for name_j in modality_names:
+            if name_i >= name_j:
+                continue
+
+            # Similarity matrix: (N, N)
+            sim = all_embeddings[name_i] @ all_embeddings[name_j].T
+            N = sim.size(0)
+
+            # Ground truth: samples with same concept_id match
+            gt_match = (all_labels.unsqueeze(0) == all_labels.unsqueeze(1))  # (N, N)
+
+            r1_sum = 0
+            r5_sum = 0
+            mrr_sum = 0
+
+            for i in range(N):
+                # Rank all candidates by similarity
+                scores = sim[i]
+                ranked = scores.argsort(descending=True)
+
+                # Find rank of first correct match
+                for rank, idx in enumerate(ranked):
+                    if gt_match[i, idx] and idx != i:  # exclude self
+                        r1_sum += (rank == 0)
+                        r5_sum += (rank < 5)
+                        mrr_sum += 1.0 / (rank + 1)
+                        break
+
+            pair_key = f"{name_i}↔{name_j}"
+            results[f"{pair_key}/R@1"] = r1_sum / N
+            results[f"{pair_key}/R@5"] = r5_sum / N
+            results[f"{pair_key}/MRR"] = mrr_sum / N
+
+    return results
+
