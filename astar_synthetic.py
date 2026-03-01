@@ -988,3 +988,61 @@ def evaluate_transitive_consistency(
     return results
 
 
+
+# ============================================
+# STEP 7: Effective Rank Tracking 
+# ============================================
+# Verify the theoretical claim: rank → M when consistent.
+
+def compute_rank_statistics(
+    model: nn.Module,
+    dataset: Dataset,
+    modality_names: List[str],
+    tokens_per_modality: Dict[str, int],
+    batch_size: int = 32,
+) -> Dict[str, float]:
+    """
+    Compute effective rank of P matrices and compare to 
+    the theoretical bound of M.
+
+    Verifies that nuclear norm drives the block P matrix toward low rank.
+    """
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    M = min(tokens_per_modality.values())  # theoretical minimum rank
+    N = len(modality_names)
+
+    all_effective_ranks = []
+    all_sv_profiles = []
+
+    with torch.no_grad():
+        for batch in loader:
+            *modality_inputs_list, labels = batch
+            modality_inputs = {
+                name: inp.to(device) for name, inp in zip(modality_names, modality_inputs_list)
+            }
+            _, attn_dict, _ = model(modality_inputs)
+
+            # Build P for each sample in the batch
+            P_batch = build_batch_P_matrices(
+                attn_dict, modality_names, tokens_per_modality, len(labels)
+            )
+
+            for b in range(len(labels)):
+                svs = torch.linalg.svdvals(P_batch[b])
+                all_sv_profiles.append(svs.cpu().numpy())
+
+                # Effective rank: count SVs above 1% of the largest
+                threshold = 0.01 * svs[0]
+                eff_rank = (svs > threshold).sum().item()
+                all_effective_ranks.append(eff_rank)
+
+    return {
+        "mean_effective_rank": np.mean(all_effective_ranks),
+        "std_effective_rank": np.std(all_effective_ranks),
+        "theoretical_min_rank": M,
+        "rank_ratio": np.mean(all_effective_ranks) / M,  # ideally → 1.0
+        "mean_sv_profile": np.mean(all_sv_profiles, axis=0),
+    }
+
