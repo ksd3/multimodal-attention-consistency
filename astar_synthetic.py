@@ -644,3 +644,47 @@ def contrastive_loss(
 
 
 # --- (c) BASELINE: Cycle-Consistency Loss ---
+
+def cycle_consistency_loss(
+    attn_dict: Dict[Tuple[str, str], torch.Tensor],
+    modality_names: List[str],
+) -> torch.Tensor:
+    """
+    Enforce: if I go A→B→A, I should end up where I started.
+
+    Formally: attn(B→A) @ attn(A→B) ≈ Identity
+
+    This is the classical cycle-consistency idea from CycleGAN, 
+    applied to attention matrices.
+
+    LIMITATION THIS PAPER EXPOSES:
+    Cycle-consistency only enforces round-trip consistency 
+    for PAIRS. It does NOT enforce three-way transitivity.
+    A→B→A = I and B→C→B = I does NOT guarantee A→C→A = I.
+    """
+    total_loss = 0
+    num_cycles = 0
+
+    for i, name_i in enumerate(modality_names):
+        for j, name_j in enumerate(modality_names):
+            if i >= j:
+                continue
+
+            # Forward: A → B
+            A_ij = attn_dict[(name_i, name_j)]  # (B, T_i, T_j)
+            # Backward: B → A
+            A_ji = attn_dict[(name_j, name_i)]  # (B, T_j, T_i)
+
+            # Round trip: should be identity
+            # (B, T_i, T_j) @ (B, T_j, T_i) = (B, T_i, T_i)
+            round_trip = torch.bmm(A_ij, A_ji)
+            T_i = round_trip.size(1)
+            identity = torch.eye(T_i, device=round_trip.device).unsqueeze(0).expand_as(round_trip)
+
+            total_loss += F.mse_loss(round_trip, identity)
+            num_cycles += 1
+
+    return total_loss / num_cycles
+
+
+# --- (d) BASELINE: Mutual Information Proxy ---
