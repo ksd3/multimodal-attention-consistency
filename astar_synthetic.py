@@ -688,3 +688,47 @@ def cycle_consistency_loss(
 
 
 # --- (d) BASELINE: Mutual Information Proxy ---
+
+def mutual_information_loss(
+    embeddings_dict: Dict[str, torch.Tensor],
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Maximize mutual information between modality embeddings.
+
+    Uses the MINE (Mutual Information Neural Estimation) lower bound.
+    For simplicity, we use a bilinear approximation:
+        MI(X, Y) ≈ E[x^T W y] - log E[exp(x^T W y')]
+    where y' is drawn from the marginal (shuffled).
+
+    This is another common approach to multimodal alignment.
+    """
+    modality_names = sorted(embeddings_dict.keys())
+    total_loss = 0
+    num_pairs = 0
+
+    for i, name_i in enumerate(modality_names):
+        for j, name_j in enumerate(modality_names):
+            if i >= j:
+                continue
+
+            emb_i = embeddings_dict[name_i].mean(dim=1)  # (B, D)
+            emb_j = embeddings_dict[name_j].mean(dim=1)  # (B, D)
+
+            # Joint: matching pairs
+            joint_scores = (emb_i * emb_j).sum(dim=-1)  # (B,)
+
+            # Marginal: shuffled pairs
+            perm = torch.randperm(emb_j.size(0))
+            marginal_scores = (emb_i * emb_j[perm]).sum(dim=-1)
+
+            # MINE lower bound on MI (we want to MAXIMIZE, so negate)
+            mi_estimate = joint_scores.mean() - \
+                          torch.logsumexp(marginal_scores, dim=0) + \
+                          np.log(marginal_scores.size(0))
+
+            total_loss += -mi_estimate  # negate to minimize
+            num_pairs += 1
+
+    return total_loss / num_pairs
+
