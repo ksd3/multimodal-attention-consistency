@@ -255,3 +255,37 @@ class MultiTokenSyntheticDataset(Dataset):
         # Return modalities in sorted name order to match model's sorted keys
         return tuple(s[name] for name in self.modality_names) + (s["concept_id"],)
 
+
+# ============================================
+# STEP 2: Model Architecture (Multi-Token)
+# ============================================
+
+class ModalityEncoder(nn.Module):
+    """
+    Encodes raw modality tokens into shared embedding space.
+    Includes positional encoding so the model knows token order.
+    """
+    def __init__(self, input_dim: int, hidden_dim: int, max_tokens: int):
+        super().__init__()
+        self.projection = nn.Linear(input_dim, hidden_dim)
+        self.pos_encoding = nn.Parameter(
+            torch.randn(1, max_tokens, hidden_dim) * 0.02
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+        )
+
+    def forward(self, x):
+        """
+        x: (batch, num_tokens, raw_dim)
+        returns: (batch, num_tokens, hidden_dim)
+        """
+        h = self.projection(x)                          # (B, T, D)
+        h = h + self.pos_encoding[:, :h.size(1), :]     # add position
+        h = self.norm(h + self.mlp(h))                  # FFN + residual
+        return h
+
