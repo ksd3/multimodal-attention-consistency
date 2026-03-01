@@ -337,3 +337,89 @@ class CrossAttentionLayer(nn.Module):
 
         return output, avg_weights
 
+
+class MultimodalTransformerMultiToken(nn.Module):
+    """
+    Full multimodal transformer supporting N modalities,
+    each with variable number of tokens.
+
+    Parameterized to support 2-5 modalities for the scaling experiment.
+    """
+    def __init__(
+        self,
+        num_concepts: int,
+        modality_configs: Dict[str, Tuple[int, int]],
+        # e.g. {"audio": (64, 5), "video": (128, 4), "text": (32, 3)}
+        # maps modality name → (raw_dim, num_tokens)
+    ):
+        super().__init__()
+        self.modality_names = sorted(modality_configs.keys())
+        self.num_modalities = len(self.modality_names)
+
+        # Per-modality encoders
+        self.encoders = nn.ModuleDict()
+        for name, (raw_dim, num_tokens) in modality_configs.items():
+            self.encoders[name] = ModalityEncoder(
+                raw_dim, cfg.embedding_dim, num_tokens
+            )
+
+        # Cross-attention for ALL ordered pairs of modalities
+        # e.g. for 3 modalities: 6 cross-attention blocks
+        self.cross_attns = nn.ModuleDict()
+        for i, name_i in enumerate(self.modality_names):
+            for j, name_j in enumerate(self.modality_names):
+                if i != j:
+                    key = f"{name_i}_to_{name_j}"
+                    self.cross_attns[key] = CrossAttentionLayer(
+                        cfg.embedding_dim, cfg.num_heads
+                    )
+
+        # Classification head: pool all tokens from all modalities → predict concept
+        self.pool = nn.AdaptiveAvgPool1d(1)  # pool over token dimension
+        self.classifier = nn.Sequential(
+            nn.Linear(cfg.embedding_dim * self.num_modalities, cfg.embedding_dim),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.embedding_dim, num_concepts),
+        )
+
+    def forward(self, modality_inputs: Dict[str, torch.Tensor]):
+        """
+        modality_inputs: {"audio": (B, T_a, D_a), "video": (B, T_v, D_v), ...}
+
+        returns:
+            logits:    (B, num_concepts)
+            attn_dict: {("audio","video"): (B, T_a, T_v), ...} — all cross-attn weights
+            embeddings_dict: {"audio": (B, T_a, D), ...} — encoded representations
+        """
+        # Encode each modality
+        encoded = {}
+        for name in self.modality_names:
+            encoded[name] = self.encoders[name](modality_inputs[name])
+
+        # Cross-attention between all pairs
+        attn_dict = {}
+        for i, name_i in enumerate(self.modality_names):
+            for j, name_j in enumerate(self.modality_names):
+                if i != j:
+                    key = f"{name_i}_to_{name_j}"
+                    output, weights = self.cross_attns[key](
+                        encoded[name_i], encoded[name_j]
+                    )
+                    # Update encoding with cross-attended output
+                    encoded[name_i] = output
+                    # Store attention weights: (B, T_i, T_j)
+                    attn_dict[(name_i, name_j)] = weights
+
+        # Pool and classify
+        pooled = []
+        for name in self.modality_names:
+            # (B, T, D) → (B, D)
+            p = encoded[name].mean(dim=1)
+            pooled.append(p)
+
+        fused = torch.cat(pooled, dim=-1)  # (B, N*D)
+        logits = self.classifier(fused)    # (B, num_concepts)
+
+        return logits, attn_dict, encoded
+
