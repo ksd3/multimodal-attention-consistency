@@ -854,3 +854,137 @@ def evaluate_retrieval_from_embeddings(
 
     return results
 
+
+# ============================================
+# STEP 6: Transitive Consistency Evaluation
+# ============================================
+# Transitive consistency evaluation.
+# 
+# Question: If A→B alignment is correct and B→C alignment is correct,
+#           is A→C alignment ALSO correct?
+#
+# Contrastive and cycle-consistency losses don't guarantee this.
+# Nuclear norm DOES because it constrains the entire matrix jointly.
+
+def evaluate_transitive_consistency(
+    model: nn.Module,
+    dataset: Dataset,
+    modality_names: List[str],
+    batch_size: int = 256,
+) -> Dict[str, float]:
+    """
+    Measures transitive consistency of cross-modal attention patterns.
+
+    Key insight: nuclear norm on the block P matrix encourages low rank,
+    which means cross-attention sub-blocks satisfy P_AC ≈ P_AB @ P_BC.
+    This is the COMPOSITIONAL CONSISTENCY that distinguishes our method
+    from pairwise-only approaches (contrastive, cycle, MI).
+
+    Metrics:
+    1. Attention composition error: ||P_AB @ P_BC - P_AC||_F (lower = better)
+    2. Attention composition correlation (higher = better)
+    3. Embedding-level chained retrieval agreement (for completeness)
+    """
+    model.eval()
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    assert len(modality_names) >= 3, "Need >= 3 modalities for transitivity test"
+
+    mod_a, mod_b, mod_c = modality_names[0], modality_names[1], modality_names[2]
+
+    # Collect attention matrices and embeddings
+    all_attn_ab, all_attn_bc, all_attn_ac = [], [], []
+    all_emb = {name: [] for name in modality_names}
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in loader:
+            *modality_inputs_list, labels = batch
+            modality_inputs = {
+                name: inp.to(device) for name, inp in zip(modality_names, modality_inputs_list)
+            }
+            logits, attn_dict, encoded = model(modality_inputs)
+
+            # Attention sub-blocks: (B, T_i, T_j)
+            all_attn_ab.append(attn_dict[(mod_a, mod_b)].cpu())
+            all_attn_bc.append(attn_dict[(mod_b, mod_c)].cpu())
+            all_attn_ac.append(attn_dict[(mod_a, mod_c)].cpu())
+
+            for name in modality_names:
+                all_emb[name].append(encoded[name].mean(dim=1).cpu())
+            all_labels.append(labels)
+
+    # Concatenate attention matrices: (N, T_i, T_j)
+    attn_ab = torch.cat(all_attn_ab, dim=0)  # (N, T_a, T_b)
+    attn_bc = torch.cat(all_attn_bc, dim=0)  # (N, T_b, T_c)
+    attn_ac = torch.cat(all_attn_ac, dim=0)  # (N, T_a, T_c)
+
+    # === METRIC 1: Attention composition error ===
+    # If P is low-rank (nuclear norm's goal): P_AC ≈ P_AB @ P_BC
+    composed_attn = torch.bmm(attn_ab, attn_bc)  # (N, T_a, T_c)
+    # Per-sample Frobenius error, normalized by P_AC norm
+    per_sample_error = torch.norm(composed_attn - attn_ac, p='fro', dim=(1, 2))
+    per_sample_norm = torch.norm(attn_ac, p='fro', dim=(1, 2)) + 1e-8
+    attn_composition_error = (per_sample_error / per_sample_norm).mean().item()
+
+    # === METRIC 2: Attention composition cosine similarity ===
+    # Cosine similarity is well-defined even for low-variance vectors
+    # (unlike Pearson, which becomes noise when both vectors are near-constant)
+    comp_flat = composed_attn.reshape(composed_attn.size(0), -1)  # (N, T_a*T_c)
+    direct_flat = attn_ac.reshape(attn_ac.size(0), -1)
+    cosine_sim = F.cosine_similarity(comp_flat, direct_flat, dim=1)  # (N,)
+    attn_composition_cosine = cosine_sim.mean().item()
+
+    # === METRIC 3: Attention entropy (detects degenerate uniform attention) ===
+    # High entropy = near-uniform attention = uninformative
+    # Compute per-block (different target dims), then average
+    norm_entropies = []
+    for attn_block in [attn_ab, attn_bc, attn_ac]:
+        rows = attn_block.reshape(-1, attn_block.size(-1))  # (N*T_src, T_tgt)
+        ent = -(rows * (rows + 1e-10).log()).sum(dim=-1)     # per-row entropy
+        max_ent = np.log(rows.size(-1))                       # uniform entropy
+        norm_entropies.append((ent / (max_ent + 1e-10)).mean())
+    normalized_entropy = torch.stack(norm_entropies).mean().item()
+    # 1.0 = perfectly uniform (degenerate), 0.0 = perfectly peaked (informative)
+
+    # === METRIC 4: Entropy-weighted composition error ===
+    # Penalizes methods that achieve low error by collapsing to uniform attention
+    # informative_weight: 1 when entropy is 0, 0 when entropy is max
+    informativeness = 1.0 - normalized_entropy
+    weighted_score = informativeness * (1.0 - attn_composition_error)
+
+    # === METRIC 5: Embedding-level chained retrieval (for completeness) ===
+    for name in modality_names:
+        all_emb[name] = F.normalize(torch.cat(all_emb[name], dim=0), dim=-1)
+    all_labels = torch.cat(all_labels, dim=0)
+
+    N = all_labels.size(0)
+    gt_match = (all_labels.unsqueeze(0) == all_labels.unsqueeze(1))
+
+    sim_ab = all_emb[mod_a] @ all_emb[mod_b].T
+    sim_bc = all_emb[mod_b] @ all_emb[mod_c].T
+    sim_ac = all_emb[mod_a] @ all_emb[mod_c].T
+
+    best_b_idx = sim_ab.argmax(dim=1)
+    best_c_chain = sim_bc[best_b_idx].argmax(dim=1)
+    best_c_direct = sim_ac.argmax(dim=1)
+
+    chain_correct = gt_match[torch.arange(N), best_c_chain].float()
+    direct_correct = gt_match[torch.arange(N), best_c_direct].float()
+    agreement = (best_c_chain == best_c_direct).float()
+
+    results = {
+        # Attention-level transitivity 
+        "attn_composition_error": attn_composition_error,
+        "attn_composition_cosine": attn_composition_cosine,
+        "attn_entropy": normalized_entropy,
+        "weighted_score": weighted_score,
+        # Embedding-level retrieval transitivity
+        "chain_accuracy": chain_correct.mean().item(),
+        "direct_accuracy": direct_correct.mean().item(),
+        "agreement": agreement.mean().item(),
+    }
+
+    return results
+
+
