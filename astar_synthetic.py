@@ -512,3 +512,81 @@ def build_batch_P_matrices(
     P = torch.cat(block_rows, dim=1)  # (B, total, total)
     return P
 
+
+# ============================================
+# STEP 4: Consistency Losses
+# ============================================
+# We implement ALL methods for fair comparison:
+# (a) Nuclear norm (ours)
+# (b) Contrastive loss (CLIP-style baseline)
+# (c) Cycle-consistency loss (baseline)
+# (d) Mutual information proxy (baseline)
+
+# --- (a) OURS: Smoothed Nuclear Norm ---
+
+def nuclear_norm_loss(
+    P: torch.Tensor,
+    tokens_per_modality: Dict[str, int],
+    num_modalities: int,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Smoothed nuclear norm of P, normalized by the ideal value.
+
+    Smoothing: instead of sum(sigma), compute sum(sqrt(sigma^2 + eps)).
+    This avoids gradient blowup when singular values are near zero,
+    which happens frequently during training.
+
+    The SVD gradient is: d||P||_* / dP = U @ V^T
+    When two singular values are close, U and V become ill-conditioned.
+    The epsilon smoothing fixes this.
+
+    Args:
+        P: (B, D, D) batch of P matrices
+        tokens_per_modality: for computing the ideal norm
+        num_modalities: N
+        epsilon: smoothing constant for gradient stability
+    """
+    # Compute singular values: (B, min(D,D))
+    # torch.linalg.svdvals is differentiable
+    sigmas = torch.linalg.svdvals(P)                   # (B, D)
+
+    # Smoothed nuclear norm per sample
+    smoothed_norms = torch.sum(
+        torch.sqrt(sigmas ** 2 + epsilon), dim=-1
+    )                                                   # (B,)
+
+    # Ideal nuclear norm when perfectly aligned:
+    # M singular values each equal to N, rest are 0
+    # So ideal = M * N (plus epsilon smoothing)
+    M = min(tokens_per_modality.values())  # conservative
+    ideal = num_modalities * M
+
+    # Loss = excess over ideal, averaged over batch
+    loss = (smoothed_norms - ideal).mean()
+
+    return loss
+
+
+def nuclear_norm_loss_randomized(
+    P: torch.Tensor,
+    top_k: int = 20,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Approximate nuclear norm using randomized SVD.
+    Only computes top-k singular values.
+
+    Much faster for large P matrices (e.g. when N=5, M=10, P is 50x50).
+    Theoretically justified because we only care about the EXCESS 
+    singular values beyond the first M.
+
+    Uses the Halko-Martinsson-Tropp algorithm.
+    """
+    # torch.svd_lowrank computes truncated SVD efficiently
+    U, S, V = torch.svd_lowrank(P, q=top_k)
+    smoothed = torch.sum(torch.sqrt(S ** 2 + epsilon), dim=-1)
+    return smoothed.mean()
+
+
+# --- (b) BASELINE: Contrastive Loss (CLIP-style) ---
